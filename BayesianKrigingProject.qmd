@@ -5,6 +5,236 @@ format: html
 ---
 
 ```{r}
+library(sp)
+library(maps)
+library(sf)
+library(lattice)
+library(tidyverse)
+library(geoR)
+```
+
+
+Loading data
+
+```{r}
+data(meuse)
+data(meuse.grid)
+```
+
+
+
+Model to build:
+
+$$Y(s) = X(s)'\beta + \epsilon(s)$$
+$$\epsilon(s) \sim \textrm{Gaussian Process}$$ 
+Spatial Covariance Structures to consider:
+
+Exponential: 
+$$\textrm{Cov}\{\epsilon(s), \epsilon(s+h)\} = \sigma^2 e^{- |h / \phi|} $$
+
+Gaussian:
+
+$$\textrm{Cov}\{\epsilon(s), \epsilon(s+h)\} = \sigma^2 exp{- |h / \phi |^2}$$
+
+Spherical:
+$$
+\textrm{Cov}\{\epsilon(s), \epsilon(s+h)\} = 
+\begin{cases}
+  \sigma^2(1-\frac{3}{2}|h/ \phi| + \frac{1}{2}|h / \phi|^3) & \text{if } h \leq \phi, \\
+  0 & \text{if } h > \phi
+\end{cases}
+$$
+
+
+# Data visualization
+
+```{r}
+# configuring meuse dataset
+coordinates(meuse) <- ~ x + y
+proj4string(meuse) <- CRS("epsg:28992")
+
+# configure meuse grid dataset (has distance from meuse river pre-calculated for each location)
+data(meuse.grid)
+coordinates(meuse.grid) <- ~ x + y
+proj4string(meuse.grid) <- CRS("epsg:28992")
+gridded(meuse.grid) <- TRUE
+```
+
+
+```{r}
+meuse.grid.poly <- as(meuse.grid, "SpatialPolygons") # making meuse.grid belong to the SpatialPolygons class
+meuse.bdy <- surveillance::unionSpatialPolygons(meuse.grid.poly)
+plot(meuse.bdy)
+plot(meuse, add = TRUE, pch = 1)
+```
+
+```{r}
+# plotting distance to river
+spplot(meuse, "dist.m", do.log = FALSE, colorkey = TRUE)
+
+# plotting lead concentration
+spplot(meuse, "lead", do.log = TRUE, colorkey = FALSE)
+
+bubble(meuse, "lead", do.log = TRUE, key.space = "bottom")
+```
+
+Clearly lead concentration is higher near the river. What will that graph look like when we remove the main effect of distance to river?
+
+```{r}
+lead.lm <- lm(log(lead) ~ sqrt(dist), data = meuse)
+summary(lead.lm) # dist to river is significant as expected
+
+meuse$fitted.lead = predict(lead.lm, data = meuse)
+meuse$fitted.lead = fitted.lead - mean(fitted.lead)
+
+meuse$resid.lead = residuals(lead.lm)
+
+spplot(meuse, c("fitted.lead", "resid.lead"))
+```
+
+After removing the main effect of distance to river, there is still some inherent spatial pattern occuring in the residuals...
+
+Since these residuals are clearly not independent, we must fit a covariogram function to model them accurately. The three types of covariograms 
+underconsideration are the exponential, gaussian, and spherical covariograms.
+
+
+# Covariograms
+
+Defining some functions for each of the three previously mentioned variograms
+
+All functions take arguments in the order theta = (sigma2, phi, tau) where sigma2 is the overall variance, phi is the range (spatial dependence) parameter, tau2 is the nugget effect
+
+```{r}
+# exponential semivariogram
+exponential_vario.f <- function(theta) {
+  sigma2 <- theta[1]
+  phi <- theta[2]
+  tau2 <- theta[3]
+
+  function(h) {
+    ifelse(
+      h == 0,
+      0,
+      tau2 + sigma2 * (1 - exp(-h / phi))
+    )
+  }
+}
+
+# gaussian semivariogram
+gaussian_vario.f <- function(theta) {
+  sigma2 <- theta[1]
+  phi <- theta[2]
+  tau2 <- theta[3]
+
+  function(h) {
+    ifelse(
+      h == 0,
+      0,
+      tau2 + sigma2 * (1 - exp(-(h / phi)^2))
+    )
+  }
+}
+
+
+# spherical semivariogram
+spherical_vario.f <- function(theta) {
+  sigma2 <- theta[1]
+  phi <- theta[2]
+  tau2 <- theta[3]
+
+  function(h) {
+    ifelse(
+      h == 0,
+      0,
+      ifelse(
+        h <= phi,
+        tau2 + sigma2 * (
+          3 * h / (2 * phi) -
+          h^3 / (2 * phi^3)
+        ),
+        tau2 + sigma2
+      )
+    )
+  }
+}
+```
+
+
+Empirical semivariogram
+
+```{r}
+meuse_geodat <- as.geodata(
+  data.frame(
+    coords = coordinates(meuse),
+    data = resid(lead.lm)
+  )
+)
+
+empirical_variog <- variog(meuse_geodat)
+
+plot(empirical_variog, main = "Semivariogram")
+```
+
+
+Eyeballing exponential variogram to data:
+
+```{r}
+sigma2 = 0.2
+tau2 = 0.1
+phi = 1000
+
+h <- seq(0, 4500, length.out = 100)
+
+theta = c(sigma2, phi, tau2)
+
+gamma_h <- exponential_vario.f(theta)(h)
+
+plot(empirical_variog$u, empirical_variog$v,
+     type = "p",
+     pch = 19,
+     xlab = "Distance (h)",
+     ylab = expression(gamma(h)),
+     ylim = range(c(empirical_variog$v, gamma_h)),
+     main = "Empirical vs. Exponential Semivariogram")
+lines(h, gamma_h, col = "blue", lwd = 2)
+legend(
+  "bottomright",
+  legend = c("Empirical", "Exponential"),
+  col = c("black", "blue"),
+  pch = c(19, NA),
+  lty = c(NA, 1),
+  lwd = c(NA, 2)
+)
+```
+
+
+
+Fitting variograms to the data
+
+Maximum likelihood will be utilized to fit our variograms. Other common methods include OLS or WLS, but by using ML we have access to AIC, which is helpful in model selection.
+
+WLS is also a good choice though, since we would like to give points shorter distances away more weight than points farther away.
+
+```{r}
+exponential_vario_ML <- likfit(meuse_geodat, cov.model = "exponential",
+       ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
+
+exponential_vario_ML
+
+gaussian_vario_ML <- likfit(meuse_geodat, cov.model = "gaussian", 
+                            ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
+
+spherical_vario_ML <- likfit(meuse_geodat, cov.model = "spherical",
+                             ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
+
 
 ```
+
+
+
+
+
+
+
+
 
