@@ -95,73 +95,14 @@ spplot(meuse, c("fitted.lead", "resid.lead"))
 
 After removing the main effect of distance to river, there is still some inherent spatial pattern occuring in the residuals...
 
-Since these residuals are clearly not independent, we must fit a covariogram function to model them accurately. The three types of covariograms 
-underconsideration are the exponential, gaussian, and spherical covariograms.
+Since these residuals are clearly not independent, we must take a different modeling approach and include a spatial random effect in our model to account for these 
 
 
-# Covariograms
+# Empirical Variogram
 
-Defining some functions for each of the three previously mentioned variograms
+Empirical variograms are helpful for setting priors.
 
-All functions take arguments in the order theta = (sigma2, phi, tau) where sigma2 is the overall variance, phi is the range (spatial dependence) parameter, tau2 is the nugget effect
-
-```{r}
-# exponential semivariogram
-exponential_vario.f <- function(theta) {
-  sigma2 <- theta[1]
-  phi <- theta[2]
-  tau2 <- theta[3]
-
-  function(h) {
-    ifelse(
-      h == 0,
-      0,
-      tau2 + sigma2 * (1 - exp(-h / phi))
-    )
-  }
-}
-
-# gaussian semivariogram
-gaussian_vario.f <- function(theta) {
-  sigma2 <- theta[1]
-  phi <- theta[2]
-  tau2 <- theta[3]
-
-  function(h) {
-    ifelse(
-      h == 0,
-      0,
-      tau2 + sigma2 * (1 - exp(-(h / phi)^2))
-    )
-  }
-}
-
-
-# spherical semivariogram
-spherical_vario.f <- function(theta) {
-  sigma2 <- theta[1]
-  phi <- theta[2]
-  tau2 <- theta[3]
-
-  function(h) {
-    ifelse(
-      h == 0,
-      0,
-      ifelse(
-        h <= phi,
-        tau2 + sigma2 * (
-          3 * h / (2 * phi) -
-          h^3 / (2 * phi^3)
-        ),
-        tau2 + sigma2
-      )
-    )
-  }
-}
-```
-
-
-Empirical semivariogram
+Based on the graph below, we'd want to set a penalizing complexity (PC) prior on sigma2 as Pr(sigma2 > 0.3) = 0.05 and a PC prior on phi of Pr(phi < 500) = 0.05. These are both subjective but seem to be appropriate for the data we have.
 
 ```{r}
 meuse_geodat <- as.geodata(
@@ -175,175 +116,241 @@ empirical_variog <- variog(meuse_geodat, max.dist = 1500, estimator.type = 'clas
 
 plot(empirical_variog, main = "Semivariogram")
 
-# checking for presence of anisotropy
-plot(variogram(lead ~ dist, data=meuse, alpha=c(0,45,90,135)))  # looks good enough
-```
-
-
-Eyeballing exponential variogram to data:
-
-```{r}
-sigma2 = 0.2
-tau2 = 0.1
-phi = 1000
-
-h <- seq(0, 4500, length.out = 100)
-
-theta = c(sigma2, phi, tau2)
-
-gamma_h <- exponential_vario.f(theta)(h)
-
-plot(empirical_variog$u, empirical_variog$v,
-     type = "p",
-     pch = 19,
-     xlab = "Distance (h)",
-     ylab = expression(gamma(h)),
-     ylim = range(c(empirical_variog$v, gamma_h)),
-     main = "Empirical vs. Exponential Semivariogram")
-lines(h, gamma_h, col = "blue", lwd = 2)
-legend(
-  "bottomright",
-  legend = c("Empirical", "Exponential"),
-  col = c("black", "blue"),
-  pch = c(19, NA),
-  lty = c(NA, 1),
-  lwd = c(NA, 2)
-)
-```
-
-
-
-Fitting variograms to the data
-
-Maximum likelihood will be utilized to fit our variograms. Other common methods include OLS or WLS, but by using ML we have access to AIC, which is helpful in model selection.
-
-WLS is also a good choice though, since we would like to give points shorter distances away more weight than points farther away.
-
-AIC exp: 171.1
-AIC gaus: 170.9
-AIC sph: 169
-
-AIC shows no strong preference for any of the models. Technically using the rule of 2, it shows slight prefererence of the spherical variogram.
-
-
-```{r}
-exponential_vario_ML <- likfit(meuse_geodat, cov.model = "exponential",
-       ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
-
-gaussian_vario_ML <- likfit(meuse_geodat, cov.model = "gaussian", 
-                            ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
-
-spherical_vario_ML <- likfit(meuse_geodat, cov.model = "spherical",
-                             ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
-
-# comparing AIC values and looking at param values (sigma2, phi, nugget)
-summary(exponential_vario_ML)
-summary(gaussian_vario_ML)
-summary(spherical_vario_ML)
-
-plot(empirical_variog,
-     type = "p",
-     pch  = 19,
-     xlab = "Distance (h)",
-     ylab = expression(gamma(h)),
-     ylim = range(c(empirical_variog$v, gamma_h)),
-     main = "Empirical vs. Fitted Semivariograms"
-     )
-
-lines(exponential_vario_ML, col = "#E69F00")
-lines(gaussian_vario_ML, col = "blue")
-lines(spherical_vario_ML, col = "red")
-
-legend("bottomright",
-       legend = c("Empirical", "Exponential", "Gaussian", "Spherical"),
-       col = c("black", "#E69F00", "blue", "red"),
-       lty = c(NA, 1, 1, 1),
-       lwd = c(NA, 1, 1, 1),
-       pch = c(19, NA, NA, NA),
-       bty = "n"
-       )
+# checking for presence of anisotropy 
+#plot(variogram(lead ~ dist, data=meuse, alpha=c(0,45,90,135)))  # looks good enough
 ```
 
 
 
 # Kriging
 
-Now that we have our variogram selected (spherical variogram with $\phi$ = 795.8 (range parameter), $\sigma^2$ = 0.118 (variance parameter, partial sill), nugget 0.102), we can proceed with kriging (i.e. forming a prediction surface for unobserved locations)
 
-INLA will be used to fit a bayesian 
+INLA (Integrated Nested Laplace Approximation) will be used to fit a bayesian prediction surface to our data. 
 
 
 ```{r}
+# getting our meuse boundary
 meuse.grid.poly <- as(meuse.grid, "SpatialPolygons")
 meuse.boundary <- surveillance::unionSpatialPolygons(meuse.grid.poly)
 plot(meuse.boundary)
 
-## adding a mesh over this region
-
-# getting coords
-boundary.pts <- meuse.boundary@polygons[[1]]@Polygons[[1]]@coords
+# adding a mesh over this region
+boundary.pts <- meuse.boundary@polygons[[1]]@Polygons[[1]]@coords # getting coords of boundary points
 mesh <- fmesher::fm_mesh_2d_inla(loc = meuse@coords,
                                  loc.domain = boundary.pts, 
-                                 max.edge = c(150, 500), 
-                                 offset = c(100, 250))
+                                 max.edge = c(150, 500), # 150 length of triangles inside boundary, 500 length outside boundary
+                                 offset = c(100, 250)) # 100 inner extension of mesh around meuse boundary, 250 outer extension
+
+# plotting mesh and adding the meuse boundary and observation points
 plot(mesh)
-plot(meuse.boundary, add = TRUE, col = rgb(0, 0, 1, 0.25), lwd = 2)
-points(meuse@coords, pch = 16, col = rgb(1,0,0,0.2), cex = 0.5)
+plot(meuse.boundary, add = TRUE, col = rgb(0, 0, 1, 0.25), lwd = 2) # meuse boundary
+points(meuse@coords, pch = 16, col = rgb(1,0,0,0.2), cex = 0.9) # observation points
 ```
 
 
+# Prior sensitivity tests
 ```{r}
-spde <- inla.spde2.matern(mesh = mesh)
-# creating observation/prediction weight matrices for mesh models
-A_matrix <- inla.spde.make.A(mesh = mesh, loc = coordinates(meuse))
+######## Sensitivity of range prior #######
 
-# making spatial field index vectors
-s.index <- inla.spde.make.index(name = "spatial.field", n.spde = spde$n.spde)
+# Short-range prior  
+spde_short_range <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2, # nu = 1
+  prior.range = c(500, 0.05), # P(phi < 500m) = 0.05
+  prior.sigma = c(0.5, 0.05) # P(sigma > 0.5) = 0.05
+)
 
-## stacking all the information above together
+# Medium-range prior
+spde_medium_range <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2,
+  prior.range = c(1000, 0.05), # P(phi < 1000m) = 0.05
+  prior.sigma = c(0.5, 0.05)
+)
 
-# stack for fitting the model
+# Long-range prior
+spde_long_range <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2,
+  prior.range = c(2000, 0.05), # P(phi < 2000m) = 0.05 
+  prior.sigma = c(0.5, 0.05)
+)
+
+
+######### Sensitivity of sigma (partial sill) priors ###########
+
+spde_small_sigma <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2, # nu = 1
+  prior.range = c(1000, 0.05), # P(phi < 500m) = 0.05
+  prior.sigma = c(0.1, 0.05) # P(sigma > 0.1) = 0.05
+)
+
+spde_medium_sigma <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2, # nu = 1
+  prior.range = c(1000, 0.05), # P(phi < 500m) = 0.05
+  prior.sigma = c(0.5, 0.05) # P(sigma > 0.5) = 0.05
+)
+
+spde_large_sigma <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2, # nu = 1
+  prior.range = c(1000, 0.05), # P(phi < 500m) = 0.05
+  prior.sigma = c(1, 0.05) # P(sigma > 1) = 0.05
+)
+
+
+
+####### INLA structural setup
+
+meuse$loglead <- log(meuse$lead) # making output variable explicit in dataframe
+
+# Observation matrix (maps spatial field to our observed locations)
+A_matrix <- inla.spde.make.A( # 155 x n_mesh matrix
+  mesh = mesh,
+  loc = coordinates(meuse)
+)
+
+# Prediction matrix (maps spatial field to grid of locations in the study area)
+A.pred <- inla.spde.make.A( # n_grid x n_mesh matrix
+  mesh = mesh,
+  loc = coordinates(meuse.grid)
+)
+
+# Spatial index (tells INLA how to organize the latent spatial random effects)
+s.index <- inla.spde.make.index(
+  name = "spatial.field",
+  n.spde = spde_short_range$n.spde
+)
+
+# Model stack (organizes all the model parts properly for INLA)
 stack.modelfit <- inla.stack(
-  data = list(lead = meuse$lead),
+  data = list(loglead = meuse$loglead),
   A = list(A_matrix, 1),
-  effects = list(c(s.index, list(Intercept = 1)),
-                 list(dist = meuse$dist)),
+  effects = list(
+    s.index,
+    data.frame(
+      Intercept = 1,
+      dist = meuse$dist
+    )
+  ),
   tag = "data"
 )
 
-# prediction stack
-A.pred <- inla.spde.make.A(mesh = mesh, loc = coordinates(meuse.grid))
+# Prediction stack
 stack.pred <- inla.stack(
-  data = list(lead = NA),
+  data = list(loglead = NA), # we don't know lead concentrations at predicted locations!
   A = list(A.pred, 1),
-  effects = list(c(s.index, list(Intercept = 1)),
-                 list(dist = meuse.grid$dist)),
+  effects = list(
+    s.index,
+    data.frame(
+      Intercept = 1,
+      dist = meuse.grid$dist
+    )
+  ),
   tag = "pred"
 )
 
+# combining the model and prediction stacks
 join.stack <- inla.stack(stack.modelfit, stack.pred)
 
-inla.out.1 <- inla(
-  formula = log(lead) ~ -1 + Intercept + dist + f(spatial.field, model = spde), #formula
-  data = inla.stack.data(join.stack, spde = spde), # data and covariance model
-  family = "gaussian",
-  control.predictor = list(A = inla.stack.A(join.stack), compute = TRUE),
-  control.compute = list(cpo = TRUE, dic = TRUE)
-)
 
-summary(inla.out.1)
+# function that fits the same model under whichever SPDE prior we provide
+fit_spatial_model <- function(spde) {
 
-inla.out.1$summary.fixed
-inla.out.1$summary.random
+  inla(
+    loglead ~ -1 + Intercept + dist +
+      f(spatial.field, model = spde),
+
+    data = inla.stack.data(join.stack),
+
+    control.predictor = list(
+      A = inla.stack.A(join.stack),
+      compute = TRUE
+    ),
+
+    control.compute = list(
+      cpo = TRUE,
+      dic = TRUE
+    ),
+
+    family = "gaussian"
+  )
+}
+
+fit_short_range <- fit_spatial_model(spde_short_range)
+fit_medium_range <- fit_spatial_model(spde_medium_range)
+fit_long_range <- fit_spatial_model(spde_long_range)
+
+fit_small_sigma <- fit_spatial_model(spde_small_sigma)
+fit_medium_sigma <- fit_spatial_model(spde_medium_sigma)
+fit_large_sigma <- fit_spatial_model(spde_large_sigma)
+
+summary(fit_short_range)
+summary(fit_medium_range)
+summary(fit_long_range)
+
+
+# prior sensitivity for sigma
+
+# fixed effects
+fit_small_sigma$summary.fixed
+fit_medium_sigma$summary.fixed
+fit_large_sigma$summary.fixed
+
+
+# prior sensitivity for range
+
+# fixed effects
+fit_short_range$summary.fixed
+fit_medium_range$summary.fixed
+fit_long_range$summary.fixed
+
+# hyperparams
+# Range sensitivity
+fit_short_range$summary.hyperpar
+fit_medium_range$summary.hyperpar
+fit_long_range$summary.hyperpar
+
+# Sigma sensitivity
+fit_small_sigma$summary.hyperpar
+fit_medium_sigma$summary.hyperpar
+fit_large_sigma$summary.hyperpar
+
+
+### MAKE SENSITIVITY ANALYSIS SUMMARY TABLE HERE ###
 ```
 
 
 
+The sensitivity test for varying priors of sigma and the range (phi) show that the choice of prior has minimal effects on the model results for the fixed effects.
 
 
 
+# Choosing sensible choices for sigma, phi priors
+
+Based on the empirical variogram earlier, good prior dist choices are penalizing complexity (PC) prior on sigma2 as Pr(sigma2 > 0.3) = 0.05 and a PC prior on phi of Pr(phi < 500) = 0.05.
+
+We are looking at sigma, so a prior should be set on sigma as $Pr(\sigma > \sqrt{0.3}) = 0.05$.
+
+```{r}
+spde_final_model <- inla.spde2.pcmatern(
+  mesh = mesh,
+  alpha = 2, # nu = 1
+  prior.range = c(500, 0.05), # P(phi < 500m) = 0.05
+  prior.sigma = c(sqrt(0.3), 0.05) # P(sigma > sqrt(0.3)) = 0.05
+)
+
+fit_final_model <- fit_spatial_model(spde_final_model)
+
+fit_final_model$summary.fixed
+fit_final_model$summary.random
+```
 
 
+
+The posterior mean for distance is -2.26, and it appears to have a meaningfully strong relationship with the log(lead) concentration. Thus, for each one meter increase in distance, the log(lead) concentration decreases by 2.26 units.
 
 
 
