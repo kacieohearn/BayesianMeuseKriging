@@ -11,6 +11,8 @@ library(sf)
 library(lattice)
 library(tidyverse)
 library(geoR)
+library(gstat)
+library(INLA)
 ```
 
 
@@ -20,7 +22,6 @@ Loading data
 data(meuse)
 data(meuse.grid)
 ```
-
 
 
 Model to build:
@@ -85,7 +86,7 @@ lead.lm <- lm(log(lead) ~ sqrt(dist), data = meuse)
 summary(lead.lm) # dist to river is significant as expected
 
 meuse$fitted.lead = predict(lead.lm, data = meuse)
-meuse$fitted.lead = fitted.lead - mean(fitted.lead)
+meuse$fitted.lead = meuse$fitted.lead - mean(meuse$fitted.lead)
 
 meuse$resid.lead = residuals(lead.lm)
 
@@ -170,9 +171,12 @@ meuse_geodat <- as.geodata(
   )
 )
 
-empirical_variog <- variog(meuse_geodat)
+empirical_variog <- variog(meuse_geodat, max.dist = 1500, estimator.type = 'classical')
 
 plot(empirical_variog, main = "Semivariogram")
+
+# checking for presence of anisotropy
+plot(variogram(lead ~ dist, data=meuse, alpha=c(0,45,90,135)))  # looks good enough
 ```
 
 
@@ -215,11 +219,16 @@ Maximum likelihood will be utilized to fit our variograms. Other common methods 
 
 WLS is also a good choice though, since we would like to give points shorter distances away more weight than points farther away.
 
+AIC exp: 171.1
+AIC gaus: 170.9
+AIC sph: 169
+
+AIC shows no strong preference for any of the models. Technically using the rule of 2, it shows slight prefererence of the spherical variogram.
+
+
 ```{r}
 exponential_vario_ML <- likfit(meuse_geodat, cov.model = "exponential",
        ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
-
-exponential_vario_ML
 
 gaussian_vario_ML <- likfit(meuse_geodat, cov.model = "gaussian", 
                             ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
@@ -227,8 +236,120 @@ gaussian_vario_ML <- likfit(meuse_geodat, cov.model = "gaussian",
 spherical_vario_ML <- likfit(meuse_geodat, cov.model = "spherical",
                              ini = c(0.2, 900), nug = 0.1, lik.met = "ML", fix.nugget = FALSE)
 
+# comparing AIC values and looking at param values (sigma2, phi, nugget)
+summary(exponential_vario_ML)
+summary(gaussian_vario_ML)
+summary(spherical_vario_ML)
 
+plot(empirical_variog,
+     type = "p",
+     pch  = 19,
+     xlab = "Distance (h)",
+     ylab = expression(gamma(h)),
+     ylim = range(c(empirical_variog$v, gamma_h)),
+     main = "Empirical vs. Fitted Semivariograms"
+     )
+
+lines(exponential_vario_ML, col = "#E69F00")
+lines(gaussian_vario_ML, col = "blue")
+lines(spherical_vario_ML, col = "red")
+
+legend("bottomright",
+       legend = c("Empirical", "Exponential", "Gaussian", "Spherical"),
+       col = c("black", "#E69F00", "blue", "red"),
+       lty = c(NA, 1, 1, 1),
+       lwd = c(NA, 1, 1, 1),
+       pch = c(19, NA, NA, NA),
+       bty = "n"
+       )
 ```
+
+
+
+# Kriging
+
+Now that we have our variogram selected (spherical variogram with $\phi$ = 795.8 (range parameter), $\sigma^2$ = 0.118 (variance parameter, partial sill), nugget 0.102), we can proceed with kriging (i.e. forming a prediction surface for unobserved locations)
+
+INLA will be used to fit a bayesian 
+
+
+```{r}
+meuse.grid.poly <- as(meuse.grid, "SpatialPolygons")
+meuse.boundary <- surveillance::unionSpatialPolygons(meuse.grid.poly)
+plot(meuse.boundary)
+
+## adding a mesh over this region
+
+# getting coords
+boundary.pts <- meuse.boundary@polygons[[1]]@Polygons[[1]]@coords
+mesh <- fmesher::fm_mesh_2d_inla(loc = meuse@coords,
+                                 loc.domain = boundary.pts, 
+                                 max.edge = c(150, 500), 
+                                 offset = c(100, 250))
+plot(mesh)
+plot(meuse.boundary, add = TRUE, col = rgb(0, 0, 1, 0.25), lwd = 2)
+points(meuse@coords, pch = 16, col = rgb(1,0,0,0.2), cex = 0.5)
+```
+
+
+```{r}
+spde <- inla.spde2.matern(mesh = mesh)
+# creating observation/prediction weight matrices for mesh models
+A_matrix <- inla.spde.make.A(mesh = mesh, loc = coordinates(meuse))
+
+# making spatial field index vectors
+s.index <- inla.spde.make.index(name = "spatial.field", n.spde = spde$n.spde)
+
+## stacking all the information above together
+
+# stack for fitting the model
+stack.modelfit <- inla.stack(
+  data = list(lead = meuse$lead),
+  A = list(A_matrix, 1),
+  effects = list(c(s.index, list(Intercept = 1)),
+                 list(dist = meuse$dist)),
+  tag = "data"
+)
+
+# prediction stack
+A.pred <- inla.spde.make.A(mesh = mesh, loc = coordinates(meuse.grid))
+stack.pred <- inla.stack(
+  data = list(lead = NA),
+  A = list(A.pred, 1),
+  effects = list(c(s.index, list(Intercept = 1)),
+                 list(dist = meuse.grid$dist)),
+  tag = "pred"
+)
+
+join.stack <- inla.stack(stack.modelfit, stack.pred)
+
+inla.out.1 <- inla(
+  formula = log(lead) ~ -1 + Intercept + dist + f(spatial.field, model = spde), #formula
+  data = inla.stack.data(join.stack, spde = spde), # data and covariance model
+  family = "gaussian",
+  control.predictor = list(A = inla.stack.A(join.stack), compute = TRUE),
+  control.compute = list(cpo = TRUE, dic = TRUE)
+)
+
+summary(inla.out.1)
+
+inla.out.1$summary.fixed
+inla.out.1$summary.random
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
